@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id    TEXT PRIMARY KEY,
     project       TEXT,
     title         TEXT,
+    title_user    TEXT,
     model         TEXT,
     permission_mode TEXT,
     message_count INTEGER DEFAULT 0,
@@ -41,6 +42,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
 );
 """
 
+MIGRATIONS = [
+    # v0.1.1: add title_user column for user-set renames
+    "ALTER TABLE sessions ADD COLUMN title_user TEXT",
+]
+
 
 def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     """Open (and auto-migrate) the session catalog database."""
@@ -50,7 +56,18 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    _migrate(db)
     return db
+
+
+def _migrate(db: sqlite3.Connection):
+    """Run schema migrations that can't be expressed in CREATE IF NOT EXISTS."""
+    for sql in MIGRATIONS:
+        try:
+            db.execute(sql)
+            db.commit()
+        except sqlite3.OperationalError:
+            pass  # column/table already exists
 
 
 def resolve_session_id(db: sqlite3.Connection, partial: str) -> str | None:
@@ -61,8 +78,9 @@ def resolve_session_id(db: sqlite3.Connection, partial: str) -> str | None:
     ).fetchall()
 
     if len(rows) == 0:
+        # Match against effective title (user override or auto)
         rows = db.execute(
-            "SELECT session_id FROM sessions WHERE title LIKE ?",
+            "SELECT session_id FROM sessions WHERE COALESCE(title_user, title) LIKE ?",
             (f"%{partial}%",),
         ).fetchall()
 
