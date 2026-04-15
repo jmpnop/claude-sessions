@@ -4,15 +4,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import textwrap
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from claude_sessions.db import get_db, resolve_session_id
 from claude_sessions.parser import parse_session_jsonl
 
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+HOOK_ENTRY = {
+    "type": "command",
+    "command": "claude-sessions sync",
+}
+HOOK_EVENT = "Stop"
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -328,6 +336,214 @@ def cmd_export(args):
     db.close()
 
 
+_STRIP_PREFIXES = re.compile(
+    r"^(can you|could you|please|i want to|i need to|i'd like to|help me|let's|let me|i want you to)\b\s*",
+    re.IGNORECASE,
+)
+
+
+def _slug_from_message(message: str) -> str:
+    """Generate a short slug-like name (3-5 words) from a first message."""
+    if not message:
+        return ""
+    # Take the first ~60 chars, cut at last word boundary
+    text = message[:60].split("\n")[0].strip()
+    if len(message) > 60:
+        text = text.rsplit(" ", 1)[0] if " " in text else text
+
+    # Strip common conversational prefixes
+    text = _STRIP_PREFIXES.sub("", text).strip()
+
+    # Lowercase, replace non-alphanum with hyphens, collapse
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+    # Truncate to 3-5 words (hyphen-separated)
+    parts = slug.split("-")
+    slug = "-".join(parts[:5])
+
+    return slug
+
+
+def cmd_auto_name(args):
+    """Automatically name all untitled sessions from their first message."""
+    db = get_db()
+    dry_run = args.dry_run
+
+    rows = db.execute(
+        "SELECT session_id, first_message, project FROM sessions "
+        "WHERE title IS NULL AND title_user IS NULL AND first_message IS NOT NULL"
+    ).fetchall()
+
+    if not rows:
+        print("No untitled sessions to name.")
+        db.close()
+        return
+
+    named = 0
+    for r in rows:
+        slug = _slug_from_message(r["first_message"])
+        if not slug:
+            continue
+
+        if dry_run:
+            print(f"  {r['session_id'][:8]}  ->  {slug}")
+        else:
+            db.execute(
+                "UPDATE sessions SET title_user = ? WHERE session_id = ?",
+                (slug, r["session_id"]),
+            )
+            _upsert_fts(db, r["session_id"], slug, r["project"], r["first_message"])
+            print(f"  {r['session_id'][:8]}  ->  {slug}")
+        named += 1
+
+    if not dry_run:
+        db.commit()
+
+    label = "Would name" if dry_run else "Named"
+    print(f"\n{label} {named} session(s)")
+    db.close()
+
+
+def cmd_gc(args):
+    """Garbage collection: detect orphaned, stale, and empty sessions."""
+    db = get_db()
+    stale_days = args.days
+    clean = args.clean
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=stale_days)).isoformat()
+
+    rows = db.execute(
+        "SELECT session_id, file_path, updated_at, message_count, file_size_kb, "
+        "COALESCE(title_user, title) as effective_title, project "
+        "FROM sessions"
+    ).fetchall()
+
+    orphaned = []
+    stale = []
+    empty = []
+
+    for r in rows:
+        sid = r["session_id"]
+        fp = r["file_path"]
+        label = f"{sid[:8]}  {(r['effective_title'] or '(untitled)')[:30]:30}  [{r['project'] or '?'}]"
+
+        # Orphaned: file_path no longer exists on disk
+        if fp and not Path(fp).exists():
+            orphaned.append((sid, label, fp))
+            continue  # no point checking stale/empty if file is gone
+
+        # Empty: 0 messages or file < 1KB
+        msg_count = r["message_count"] or 0
+        size_kb = r["file_size_kb"] or 0
+        if msg_count == 0 or size_kb < 1:
+            empty.append((sid, label, msg_count, size_kb))
+
+        # Stale: not updated in more than N days
+        updated = r["updated_at"] or ""
+        if updated and updated < cutoff:
+            stale.append((sid, label, updated))
+
+    # ── Report ──
+    print(f"Session garbage collection report (stale threshold: {stale_days} days)\n")
+
+    print(f"Orphaned DB entries (file deleted): {len(orphaned)}")
+    for sid, label, fp in orphaned:
+        print(f"  {label}")
+        print(f"         missing: {fp}")
+
+    print(f"\nStale sessions (no update in {stale_days}+ days): {len(stale)}")
+    for sid, label, updated in stale:
+        print(f"  {label}  last: {updated[:10]}")
+
+    print(f"\nEmpty sessions (0 messages or <1KB): {len(empty)}")
+    for sid, label, msgs, size in empty:
+        print(f"  {label}  msgs={msgs} size={size:.0f}KB")
+
+    total_issues = len(orphaned) + len(stale) + len(empty)
+    if total_issues == 0:
+        print("\nAll clean — no issues found.")
+        db.close()
+        return
+
+    # ── Clean mode ──
+    if clean:
+        if orphaned:
+            removed = 0
+            for sid, _label, _fp in orphaned:
+                db.execute("DELETE FROM tags WHERE session_id = ?", (sid,))
+                db.execute("DELETE FROM session_fts WHERE session_id = ?", (sid,))
+                db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+                removed += 1
+            db.commit()
+            print(f"\nCleaned: removed {removed} orphaned DB entry(ies).")
+
+        if stale:
+            print(f"\nStale sessions are not auto-deleted.")
+            print(f"Consider archiving them with:")
+            for sid, _label, _updated in stale:
+                print(f"  claude-sessions archive {sid[:8]}")
+    else:
+        if orphaned:
+            print(f"\nRun with --clean to remove {len(orphaned)} orphaned entry(ies).")
+        if stale:
+            print(f"Stale sessions can be archived individually with `claude-sessions archive <id>`.")
+
+    print(f"\nSummary: {len(orphaned)} orphaned, {len(stale)} stale, {len(empty)} empty")
+    db.close()
+
+
+def cmd_hook_install(args):
+    """Install a Claude Code hook that runs 'claude-sessions sync' after every response."""
+    settings = {}
+    if CLAUDE_SETTINGS.exists():
+        settings = json.loads(CLAUDE_SETTINGS.read_text())
+
+    hooks = settings.setdefault("hooks", {})
+    event_hooks = hooks.setdefault(HOOK_EVENT, [])
+
+    # Check if already installed
+    for h in event_hooks:
+        if h.get("command") == HOOK_ENTRY["command"]:
+            print("Hook already installed.")
+            return
+
+    event_hooks.append(HOOK_ENTRY)
+
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+    print(f"Installed Claude Code hook: '{HOOK_ENTRY['command']}' on {HOOK_EVENT} event")
+    print(f"Settings written to {CLAUDE_SETTINGS}")
+
+
+def cmd_hook_uninstall(args):
+    """Remove the claude-sessions sync hook from Claude Code settings."""
+    if not CLAUDE_SETTINGS.exists():
+        print("No settings file found — nothing to uninstall.")
+        return
+
+    settings = json.loads(CLAUDE_SETTINGS.read_text())
+    hooks = settings.get("hooks", {})
+    event_hooks = hooks.get(HOOK_EVENT, [])
+
+    original_len = len(event_hooks)
+    event_hooks = [h for h in event_hooks if h.get("command") != HOOK_ENTRY["command"]]
+
+    if len(event_hooks) == original_len:
+        print("Hook not found — nothing to uninstall.")
+        return
+
+    # Clean up empty structures
+    if event_hooks:
+        hooks[HOOK_EVENT] = event_hooks
+    else:
+        hooks.pop(HOOK_EVENT, None)
+    if not hooks:
+        settings.pop("hooks", None)
+
+    CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
+    print(f"Removed Claude Code hook: '{HOOK_ENTRY['command']}'")
+    print(f"Settings written to {CLAUDE_SETTINGS}")
+
+
 # ── CLI entrypoint ──────────────────────────────────────────────────────────
 
 
@@ -371,6 +587,16 @@ def main():
     export_p = sub.add_parser("export", help="Export catalog")
     export_p.add_argument("--format", "-f", choices=["json", "parquet"], default="json")
 
+    auto_name_p = sub.add_parser("auto-name", help="Auto-name untitled sessions from first message")
+    auto_name_p.add_argument("--dry-run", action="store_true", help="Show what would be named without writing")
+
+    gc_p = sub.add_parser("gc", help="Garbage collection: find orphaned, stale, and empty sessions")
+    gc_p.add_argument("--days", type=int, default=30, help="Stale threshold in days (default: 30)")
+    gc_p.add_argument("--clean", action="store_true", help="Remove orphaned DB entries (dry-run by default)")
+
+    sub.add_parser("hook-install", help="Install Claude Code hook to auto-sync after every session")
+    sub.add_parser("hook-uninstall", help="Remove the Claude Code auto-sync hook")
+
     args = parser.parse_args()
 
     commands = {
@@ -384,6 +610,10 @@ def main():
         "archive": cmd_archive,
         "stats": cmd_stats,
         "export": cmd_export,
+        "auto-name": cmd_auto_name,
+        "gc": cmd_gc,
+        "hook-install": cmd_hook_install,
+        "hook-uninstall": cmd_hook_uninstall,
     }
 
     if args.command in commands:
