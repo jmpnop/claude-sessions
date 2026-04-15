@@ -16,10 +16,7 @@ from claude_sessions.parser import parse_session_jsonl
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
-HOOK_ENTRY = {
-    "type": "command",
-    "command": "claude-sessions sync",
-}
+HOOK_COMMAND = "claude-sessions sync"
 HOOK_EVENT = "Stop"
 
 
@@ -491,6 +488,15 @@ def cmd_gc(args):
     db.close()
 
 
+def _find_hook_entry(event_hooks: list) -> tuple[int, int] | None:
+    """Find our sync command in the matcher+hooks structure. Returns (group_idx, hook_idx) or None."""
+    for gi, group in enumerate(event_hooks):
+        for hi, hook in enumerate(group.get("hooks", [])):
+            if hook.get("command") == HOOK_COMMAND:
+                return (gi, hi)
+    return None
+
+
 def cmd_hook_install(args):
     """Install a Claude Code hook that runs 'claude-sessions sync' after every response."""
     settings = {}
@@ -500,17 +506,18 @@ def cmd_hook_install(args):
     hooks = settings.setdefault("hooks", {})
     event_hooks = hooks.setdefault(HOOK_EVENT, [])
 
-    # Check if already installed
-    for h in event_hooks:
-        if h.get("command") == HOOK_ENTRY["command"]:
-            print("Hook already installed.")
-            return
+    if _find_hook_entry(event_hooks):
+        print("Hook already installed.")
+        return
 
-    event_hooks.append(HOOK_ENTRY)
+    event_hooks.append({
+        "matcher": "",
+        "hooks": [{"type": "command", "command": HOOK_COMMAND}],
+    })
 
     CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
     CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    print(f"Installed Claude Code hook: '{HOOK_ENTRY['command']}' on {HOOK_EVENT} event")
+    print(f"Installed Claude Code hook: '{HOOK_COMMAND}' on {HOOK_EVENT} event")
     print(f"Settings written to {CLAUDE_SETTINGS}")
 
 
@@ -524,23 +531,23 @@ def cmd_hook_uninstall(args):
     hooks = settings.get("hooks", {})
     event_hooks = hooks.get(HOOK_EVENT, [])
 
-    original_len = len(event_hooks)
-    event_hooks = [h for h in event_hooks if h.get("command") != HOOK_ENTRY["command"]]
-
-    if len(event_hooks) == original_len:
+    loc = _find_hook_entry(event_hooks)
+    if not loc:
         print("Hook not found — nothing to uninstall.")
         return
 
-    # Clean up empty structures
-    if event_hooks:
-        hooks[HOOK_EVENT] = event_hooks
-    else:
+    gi, hi = loc
+    event_hooks[gi]["hooks"].pop(hi)
+    # Clean up empty groups
+    if not event_hooks[gi]["hooks"]:
+        event_hooks.pop(gi)
+    if not event_hooks:
         hooks.pop(HOOK_EVENT, None)
     if not hooks:
         settings.pop("hooks", None)
 
     CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2) + "\n")
-    print(f"Removed Claude Code hook: '{HOOK_ENTRY['command']}'")
+    print(f"Removed Claude Code hook: '{HOOK_COMMAND}'")
     print(f"Settings written to {CLAUDE_SETTINGS}")
 
 
