@@ -7,14 +7,14 @@ Claude Code stores sessions as UUID-named JSONL files under `~/.claude/projects/
 ## Install
 
 ```bash
-# From source
+# Install as a global CLI tool (recommended)
+uv tool install git+https://github.com/jmpnop/claude-sessions.git
+
+# Or from a local clone
 uv pip install .
 
 # With Parquet export support
 uv pip install ".[parquet]"
-
-# macOS .pkg (installs to /usr/local/bin)
-sudo installer -pkg dist/claude-sessions-0.1.0.pkg -target /
 ```
 
 ## Usage
@@ -35,7 +35,7 @@ claude-sessions search "gemstone"
 claude-sessions show 5a22
 claude-sessions show cosmos
 
-# Rename (persists outside Claude Code)
+# Rename (persists across syncs)
 claude-sessions rename 5a22 "cosmos-3d-design"
 
 # Tag sessions
@@ -68,14 +68,8 @@ f2492206 blenderMCP       blender-mcp-megasession   8021 103568KB               
 - Parses Claude Code JSONL session files to extract: title, project, model, message counts, first user message, timestamps
 - Stores metadata in `~/.claude/session_manager.db` (SQLite with WAL mode)
 - FTS5 full-text search across titles, projects, and first messages
+- User renames (`claude-sessions rename`) are stored separately and survive `sync`
 - Session IDs resolve by prefix match (`5a22` finds `5a2263b2-...`) or title substring
-
-## Build .pkg
-
-```bash
-./scripts/build-pkg.sh
-# Output: dist/claude-sessions-<version>.pkg
-```
 
 ## License
 
