@@ -16,7 +16,10 @@ from claude_sessions.parser import parse_session_jsonl
 CLAUDE_DIR = Path.home() / ".claude" / "projects"
 CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
 
-HOOK_COMMAND = "claude-sessions sync"
+import shutil
+import sys
+
+HOOK_COMMAND = f"{Path(sys.executable).parent / 'claude-sessions'} sync"
 HOOK_EVENT = "Stop"
 
 
