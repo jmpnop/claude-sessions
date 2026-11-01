@@ -52,8 +52,14 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     """Open (and auto-migrate) the session catalog database."""
     path = db_path or DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(str(path))
+    # Every Claude session's Stop hook runs `sync`, so many writers hit this one DB
+    # at once. Give the lock a real wait budget instead of failing fast: the connect
+    # `timeout` installs sqlite's busy handler, and `PRAGMA busy_timeout` is set
+    # FIRST so even the WAL pragma and schema creation below wait for a contended
+    # lock rather than raising "database is locked".
+    db = sqlite3.connect(str(path), timeout=30.0)
     db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout=30000")
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
     _migrate(db)

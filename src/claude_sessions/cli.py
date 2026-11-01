@@ -48,56 +48,65 @@ def cmd_sync(args):
         print(f"Claude projects directory not found: {CLAUDE_DIR}")
         return
 
+    # Phase 1: parse every session file WITHOUT touching the DB. Parsing the JSONL
+    # is the slow part; doing it between the first write and the commit held the
+    # write lock for the entire scan, so concurrent `sync` runs (one per session
+    # Stop hook) failed with "database is locked". No write lock is taken here.
+    metas = []
     for project_dir in sorted(CLAUDE_DIR.iterdir()):
         if not project_dir.is_dir():
             continue
         for jsonl in project_dir.glob("*.jsonl"):
             meta = parse_session_jsonl(jsonl)
             meta["synced_at"] = now
+            metas.append(meta)
 
-            existing = db.execute(
-                "SELECT synced_at, updated_at, title_user FROM sessions WHERE session_id = ?",
-                (meta["session_id"],),
-            ).fetchone()
+    # Phase 2: all DB mutations in one short transaction (no file I/O in between),
+    # so the write lock is held only for the fast row writes.
+    for meta in metas:
+        existing = db.execute(
+            "SELECT synced_at, updated_at, title_user FROM sessions WHERE session_id = ?",
+            (meta["session_id"],),
+        ).fetchone()
 
-            # Effective title for FTS: user override wins
-            effective_title = (existing["title_user"] if existing and existing["title_user"] else meta["title"])
+        # Effective title for FTS: user override wins
+        effective_title = (existing["title_user"] if existing and existing["title_user"] else meta["title"])
 
-            if existing:
-                db.execute(
-                    """UPDATE sessions SET
-                        project=?, title=?, model=?, permission_mode=?,
-                        message_count=?, user_messages=?, file_size_kb=?,
-                        first_message=?, updated_at=?, synced_at=?, file_path=?
-                    WHERE session_id=?""",
-                    (
-                        meta["project"], meta["title"], meta["model"],
-                        meta["permission_mode"], meta["message_count"],
-                        meta["user_messages"], meta["file_size_kb"],
-                        meta["first_message"], meta["updated_at"], now,
-                        meta["file_path"], meta["session_id"],
-                    ),
-                )
-                _upsert_fts(db, meta["session_id"], effective_title, meta["project"], meta["first_message"])
-                count_updated += 1
-            else:
-                db.execute(
-                    """INSERT INTO sessions
-                        (session_id, project, title, model, permission_mode,
-                         message_count, user_messages, file_size_kb,
-                         first_message, created_at, updated_at, synced_at, file_path)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        meta["session_id"], meta["project"], meta["title"],
-                        meta["model"], meta["permission_mode"],
-                        meta["message_count"], meta["user_messages"],
-                        meta["file_size_kb"], meta["first_message"],
-                        meta["created_at"], meta["updated_at"], now,
-                        meta["file_path"],
-                    ),
-                )
-                _upsert_fts(db, meta["session_id"], meta["title"], meta["project"], meta["first_message"])
-                count_new += 1
+        if existing:
+            db.execute(
+                """UPDATE sessions SET
+                    project=?, title=?, model=?, permission_mode=?,
+                    message_count=?, user_messages=?, file_size_kb=?,
+                    first_message=?, updated_at=?, synced_at=?, file_path=?
+                WHERE session_id=?""",
+                (
+                    meta["project"], meta["title"], meta["model"],
+                    meta["permission_mode"], meta["message_count"],
+                    meta["user_messages"], meta["file_size_kb"],
+                    meta["first_message"], meta["updated_at"], now,
+                    meta["file_path"], meta["session_id"],
+                ),
+            )
+            _upsert_fts(db, meta["session_id"], effective_title, meta["project"], meta["first_message"])
+            count_updated += 1
+        else:
+            db.execute(
+                """INSERT INTO sessions
+                    (session_id, project, title, model, permission_mode,
+                     message_count, user_messages, file_size_kb,
+                     first_message, created_at, updated_at, synced_at, file_path)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    meta["session_id"], meta["project"], meta["title"],
+                    meta["model"], meta["permission_mode"],
+                    meta["message_count"], meta["user_messages"],
+                    meta["file_size_kb"], meta["first_message"],
+                    meta["created_at"], meta["updated_at"], now,
+                    meta["file_path"],
+                ),
+            )
+            _upsert_fts(db, meta["session_id"], meta["title"], meta["project"], meta["first_message"])
+            count_new += 1
 
     db.commit()
     db.close()
